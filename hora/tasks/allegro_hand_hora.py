@@ -401,11 +401,8 @@ class AllegroHandHora(VecTask):
         expert_qpos = self.allegro_hand_default_dof_pos.repeat(self.num_envs, 1)
         delta_qpos = self.allegro_hand_dof_pos - expert_qpos
 
-        # (B) 手掌相对位置误差 (要求手掌在球的正上方 6 厘米处)
-        ideal_rel_pos = torch.zeros_like(palm_pos)
-        ideal_rel_pos[:, 2] = 0.06  # Z轴上方 0.06m
-        actual_rel_pos = palm_pos - self.object_pos
-        delta_target_hand_pos = actual_rel_pos - ideal_rel_pos
+        # (B) 手掌相对位置误差 (已废弃，保留参数占位)
+        delta_target_hand_pos = torch.zeros_like(palm_pos)  # 已废弃，保留参数占位
 
         # (C) 手掌旋转误差 (要求手掌保持初始向下的旋转状态)
         ideal_hand_rot = self.hand_start_states[:, 3:7]  # 读取初始手掌朝向
@@ -789,10 +786,10 @@ def compute_hand_reward(
     lift_z = object_init_z + 0.6 + 0.003
 
     goal_hand_rew = torch.zeros_like(finger_dist)
-    goal_hand_rew = torch.where(flag == 2, 1.0 * (0.9 - 2.0 * goal_dist), goal_hand_rew)
+    goal_hand_rew = torch.where(flag == 2, torch.clamp(1.0 * (0.9 - 2.0 * goal_dist), min=0.0), goal_hand_rew)
 
     hand_up = torch.zeros_like(finger_dist)
-    hand_up = torch.where(lowest >= lift_z, torch.where(flag == 2, 0.1 + 0.1 * actions[:, 2], hand_up), hand_up)
+    hand_up = torch.where(lowest >= lift_z, torch.where(flag == 2, 0.1 + 0.1 * torch.clamp(actions[:, 2], min=0.0), hand_up), hand_up)
     hand_up = torch.where(lowest >= 0.80, torch.where(flag == 2, 0.2 - goal_hand_dist * 0, hand_up), hand_up)
 
     bonus = torch.zeros_like(goal_dist)
