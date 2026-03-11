@@ -800,9 +800,9 @@ def compute_hand_reward(
     bonus = torch.where(flag == 2, torch.where(goal_dist <= 0.05, 1.0 / (1.0 + 10.0 * goal_dist), bonus), bonus)
 
     # ==========================================
-    # 4. 汇总总分 (原版扣分系数 -0.5 * delta_value)
+    # 4. 汇总总分 (对齐 UniDexGrasp2 else 分支，不扣 delta_value)
     # ==========================================
-    reward = -0.5 * finger_dist - 1.0 * hand_dist + goal_hand_rew + hand_up + bonus - 0.5 * delta_value
+    reward = -0.5 * finger_dist - 1.0 * hand_dist + goal_hand_rew + hand_up + bonus
 
     resets = torch.where(lowest < reset_z_threshold, torch.ones_like(reset_buf), reset_buf)
     resets = torch.where(progress_buf >= max_episode_length, torch.ones_like(resets), resets)
