@@ -284,6 +284,9 @@ class AllegroHandHora(VecTask):
             device=self.device, dtype=torch.float
         )
         self.hand_start_states = torch.zeros((self.num_envs, 7), device=self.device, dtype=torch.float)
+        self.hand_start_states[:, 0] = 0.0   # x
+        self.hand_start_states[:, 1] = 0.0   # y
+        self.hand_start_states[:, 2] = 0.2   # z（与 _init_object_pose 里的初始高度一致）
         self.hand_start_states[:, 3:7] = initial_hand_quat.unsqueeze(0).repeat(self.num_envs, 1)
 
         # =========================================================================
@@ -336,7 +339,28 @@ class AllegroHandHora(VecTask):
         # 6. 将更新后的物体位置写入仿真器
         object_indices = torch.unique(self.object_indices[env_ids]).to(torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.root_state_tensor), gymtorch.unwrap_tensor(object_indices), len(object_indices))
-        
+
+        # --- 【重置手掌 Base 的世界坐标位置】 ---
+        # 手掌通过外力驱动（apply_forces），episode 结束时可能飞到任何位置
+        # 必须把 root_state 里手的位置/速度重置回初始值，否则下一个 episode 从随机位置开始
+        hand_root_indices = self.hand_indices[env_ids]
+        self.root_state_tensor[hand_root_indices, 0] = 0.0   # x
+        self.root_state_tensor[hand_root_indices, 1] = 0.0   # y
+        self.root_state_tensor[hand_root_indices, 2] = 0.2   # z（初始高度）
+        # 保留初始旋转（从 hand_start_states 读取）
+        self.root_state_tensor[hand_root_indices, 3:7] = self.hand_start_states[env_ids, 3:7]
+        # 清零线速度和角速度
+        self.root_state_tensor[hand_root_indices, 7:13] = 0.0
+
+        # 将手掌位置写入仿真器（hand_indices 和 object_indices 分开写）
+        hand_root_indices_int32 = hand_root_indices.to(torch.int32)
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_state_tensor),
+            gymtorch.unwrap_tensor(hand_root_indices_int32),
+            len(hand_root_indices_int32)
+        )
+
         # 7. 将更新后的机械手姿态写入仿真器
         hand_indices = self.hand_indices[env_ids].to(torch.int32)
         if not self.torque_control:
@@ -763,7 +787,7 @@ def compute_hand_reward(
             torch.norm(object_pos - rf_pos, p=2, dim=-1) +
             torch.norm(object_pos - th_pos, p=2, dim=-1)
     )
-    finger_dist = torch.where(finger_dist >= 3.0, 3.0 + 0 * finger_dist, finger_dist)
+    finger_dist = torch.where(finger_dist >= 2.0, 2.0 + 0 * finger_dist, finger_dist)
 
     # ==========================================
     # 2. 【核心】：100% 还原 UniDexGrasp 的模仿学习惩罚公式
