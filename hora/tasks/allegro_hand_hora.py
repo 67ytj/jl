@@ -392,7 +392,7 @@ class AllegroHandHora(VecTask):
         target_pos = torch.zeros_like(self.object_pos)
         target_pos[:, 0] = self.object_init_state[:, 0]
         target_pos[:, 1] = self.object_init_state[:, 1]
-        target_pos[:, 2] = 0.24
+        target_pos[:, 2] = self.object_init_state[:, 2] + 0.6  # 对齐 lift_z = object_init_z + 0.6
 
         # ==========================================
         # 2. 构造你的“手工专家先验数据” (代替 Uni 的数据集)
@@ -712,13 +712,12 @@ class AllegroHandHora(VecTask):
 
     def _init_object_pose(self):
         allegro_hand_start_pose = gymapi.Transform()
-        # 【修改】将机械手掌心初始化在 0.5m 高空
-        allegro_hand_start_pose.p = gymapi.Vec3(0.0, 0.0, 0.5) 
+        # 【修改】将机械手掌心初始化在 0.2m 高空
+        allegro_hand_start_pose.p = gymapi.Vec3(0.0, 0.0, 0.2) 
         
         # --- 【关键修正：将掌心旋转至垂直向下】 ---
-        # 原本的组合 (-np.pi/2 Y * np.pi/2 X) 导致了掌心朝上
-        # 修正为绕 Y 轴旋转 pi/2，这通常能让 Allegro 手的掌心正对地面 (-Z 方向)
-        allegro_hand_start_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), np.pi / 2)
+        # 绕 X 轴旋转 pi/2，让 Allegro 手的掌心正对地面 (-Z 方向)
+        allegro_hand_start_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi / 2)
 
         object_start_pose = gymapi.Transform()
         # 【修正】Vec3 只能接收 3 个参数 (x, y, z)，设置球在桌面的高度为 0.04m
