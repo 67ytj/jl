@@ -13,7 +13,7 @@ task.env.randomization.randomizeFriction=True \
 task.env.randomization.randomizePDGains=True \
 task.env.randomization.randomizeScale=True \
 task.env.randomization.jointNoiseScale=0.005 \
-task.env.reset_height_threshold=0.6 \
+task.env.reset_height_threshold=0.01 \
 task.env.forceScale=2 task.env.randomForceProbScalar=0.25 \
 train.ppo.priv_info=True \
 train.ppo.output_name=AllegroHandHora/"${CACHE}" \
