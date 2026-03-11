@@ -1,0 +1,103 @@
+name: AllegroHandHora
+physics_engine: ${..physics_engine}
+on_evaluation: False
+
+env:
+  numEnvs: ${resolve_default:64,${...num_envs}}
+  numObservations: 96
+  numActions: 19 #【修改这里】从 16 改为 19,这多出来的 3 个维度将作为 $X, Y, Z$ 方向的推力。
+  envSpacing: 0.5 
+  episodeLength: 400
+  enableDebugVis: True
+  aggregateMode: 1
+
+  controller:
+    torque_control: True 
+    controlFrequencyInv: 6
+    pgain: 3
+    dgain: 0.1
+
+  genGrasps: False
+  clipObservations: 5.0
+  clipActions: 1.0
+  reset_height_threshold: 0.01
+  # 关键修复：如果你没有 cache 文件夹里的文件，请先尝试将此项改为空或不存在的名字
+  grasp_cache_name: '' 
+
+  forceScale: 0.0
+  randomForceProbScalar: 0.0
+  forceDecay: 0.9
+  forceDecayInterval: 0.08
+
+  hora:
+    propHistoryLen: 30
+    privInfoDim: 9
+
+  reward:
+    angvelClipMin: -0.5
+    angvelClipMax: 0.5
+    rotateRewardScale: 1.0
+    objLinvelPenaltyScale: -0.3
+    # 修复 KeyError: 必须用代码要求的名字
+    poseDiffPenaltyScale: -0.3
+    torquePenaltyScale: -0.1
+    workPenaltyScale: -2.0
+
+  baseObjScale: 0.8
+  
+  randomization:
+    randomizeMass: True
+    randomizeMassLower: 0.02
+    randomizeMassUpper: 0.25
+    randomizeCOM: True
+    randomizeCOMLower: -0.01
+    randomizeCOMUpper: 0.01
+    randomizeFriction: True
+    randomizeFrictionLower: 0.3
+    randomizeFrictionUpper: 3.0
+    randomizeScale: True
+    # 修复 KeyError: 补全缺失参数
+    randomizeScaleLower: 0.7
+    randomizeScaleUpper: 0.9
+    randomizePDGains: True
+    randomizePGainLower: 0.8
+    randomizePGainUpper: 1.2
+    randomizeDGainLower: 0.8
+    randomizeDGainUpper: 1.2
+    scaleListInit: True
+    randomizeScaleList: [0.7, 0.75, 0.8, 0.85]
+    jointNoiseScale: 0.02
+
+  privInfo:
+    enableObjPos: True
+    enableObjScale: True
+    enableObjMass: True
+    enableObjCOM: True
+    enableObjFriction: True
+
+  object:
+    type: 'simple_tennis_ball' 
+    sampleProb: [1.0]
+
+  asset:
+    handAsset: 'assets/allegro/allegro_internal.urdf'
+
+  enableCameraSensors: False
+
+sim:
+  dt: 0.0083333
+  substeps: 1
+  up_axis: 'z'
+  use_gpu_pipeline: ${eq:${...pipeline},'gpu'}
+  gravity: [0.0, 0.0, -9.81]
+  physx:
+    num_threads: ${....num_threads}
+    solver_type: ${....solver_type}
+    use_gpu: ${contains:'cuda',${....sim_device}}
+    num_position_iterations: 8
+    num_velocity_iterations: 0
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: ${....num_subscenes}
+    contact_offset: 0.002
+    rest_offset: 0.0
+    contact_collection: 2
