@@ -790,19 +790,7 @@ def compute_hand_reward(
     finger_dist = torch.where(finger_dist >= 2.0, 2.0 + 0 * finger_dist, finger_dist)
 
     # ==========================================
-    # 2. 【核心】：100% 还原 UniDexGrasp 的模仿学习惩罚公式
-    # ==========================================
-    # 计算曼哈顿距离(p=1)和旋转误差角度
-    delta_hand_pos_value = torch.norm(delta_target_hand_pos, p=1, dim=-1)
-    delta_hand_rot_value = 2.0 * torch.asin(
-        torch.clamp(torch.norm(delta_target_hand_rot[:, 0:3], p=2, dim=-1), max=1.0))
-    delta_qpos_value = torch.norm(delta_qpos, p=1, dim=-1)
-
-    # Uni 官方给定的三种误差的绝对权重比例
-    delta_value = 0.6 * delta_hand_pos_value + 0.04 * delta_hand_rot_value + 0.1 * delta_qpos_value
-
-    # ==========================================
-    # 3. 状态机门控逻辑与奖励 (0.6 与 0.12 阈值)
+    # 2. 状态机门控逻辑与奖励 (0.6 与 0.12 阈值)
     # ==========================================
     flag = (finger_dist <= 0.6).int() + (hand_dist <= 0.12).int()
 
@@ -810,17 +798,17 @@ def compute_hand_reward(
     lift_z = object_init_z + 0.6 + 0.003
 
     goal_hand_rew = torch.zeros_like(finger_dist)
-    goal_hand_rew = torch.where(flag == 2, torch.clamp(1.0 * (0.9 - 2.0 * goal_dist), min=0.0), goal_hand_rew)
+    goal_hand_rew = torch.where(flag == 2, 1.0 * (0.9 - 2.0 * goal_dist), goal_hand_rew)
 
     hand_up = torch.zeros_like(finger_dist)
-    hand_up = torch.where(lowest >= lift_z, torch.where(flag == 2, 0.1 + 0.1 * torch.clamp(actions[:, 2], min=0.0), hand_up), hand_up)
+    hand_up = torch.where(lowest >= lift_z, torch.where(flag == 2, 0.1 + 0.1 * actions[:, 2], hand_up), hand_up)
     hand_up = torch.where(lowest >= 0.80, torch.where(flag == 2, 0.2 - goal_hand_dist * 0, hand_up), hand_up)
 
     bonus = torch.zeros_like(goal_dist)
     bonus = torch.where(flag == 2, torch.where(goal_dist <= 0.05, 1.0 / (1.0 + 10.0 * goal_dist), bonus), bonus)
 
     # ==========================================
-    # 4. 汇总总分 (对齐 UniDexGrasp2 else 分支，不扣 delta_value)
+    # 3. 汇总总分 (对齐 UniDexGrasp2 else 分支，不扣 delta_value)
     # ==========================================
     reward = -0.5 * finger_dist - 1.0 * hand_dist + goal_hand_rew + hand_up + bonus
 
