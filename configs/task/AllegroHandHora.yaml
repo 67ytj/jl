@@ -33,8 +33,10 @@ env:
     propHistoryLen: 30
     privInfoDim: 9
 
-  # 奖励参数已内置在 compute_hand_reward (对齐 UniDexGrasp2 else 分支)
-  # 关键阈值: finger_dist<=0.6, hand_dist<=0.12, lift_z=object_init_z+0.6+0.003
+  # 奖励阈值已内置在 compute_hand_reward JIT 函数中 (对齐 UniDexGrasp2 else 分支)
+  # finger_dist clamp=2.0 (4 指 Allegro，等比 Uni 5 指的 3.0)
+  # flag 门控: finger_dist<=0.6, hand_dist<=0.12
+  # lift_z = object_init_z + 0.6 + 0.003
   reward: {}
 
   baseObjScale: 0.8

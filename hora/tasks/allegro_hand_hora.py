@@ -702,8 +702,9 @@ class AllegroHandHora(VecTask):
         self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, 32), device=self.device, dtype=torch.float)
 
     def _setup_reward_config(self, r_config):
-        # 奖励参数已内置在 compute_hand_reward 中 (对齐 UniDexGrasp2 else 分支)
-        # 以下阈值和系数直接写在 JIT 函数里，无需从 config 加载
+        # 保留方法以与其他 _setup_* 方法保持一致的初始化模式
+        # 奖励阈值已内置在 compute_hand_reward JIT 函数中 (对齐 UniDexGrasp2 else 分支):
+        #   finger_dist <= 0.6, hand_dist <= 0.12, lift_z = object_init_z + 0.6 + 0.003
         pass
 
     def _create_object_asset(self):
