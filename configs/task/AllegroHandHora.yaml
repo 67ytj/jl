@@ -33,15 +33,9 @@ env:
     propHistoryLen: 30
     privInfoDim: 9
 
-  reward:
-    angvelClipMin: -0.5
-    angvelClipMax: 0.5
-    rotateRewardScale: 1.0
-    objLinvelPenaltyScale: -0.3
-    # 修复 KeyError: 必须用代码要求的名字
-    poseDiffPenaltyScale: -0.3
-    torquePenaltyScale: -0.1
-    workPenaltyScale: -2.0
+  # 奖励参数已内置在 compute_hand_reward (对齐 UniDexGrasp2 else 分支)
+  # 关键阈值: finger_dist<=0.6, hand_dist<=0.12, lift_z=object_init_z+0.6+0.003
+  reward: {}
 
   baseObjScale: 0.8
   
