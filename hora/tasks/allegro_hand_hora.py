@@ -147,7 +147,7 @@ class AllegroHandHora(VecTask):
         self.base_max_speed = 0.5   # maximum translation speed (m/s)
         self.base_ws_x = (-0.3, 0.3)   # workspace x bounds (m)
         self.base_ws_y = (-0.3, 0.3)   # workspace y bounds (m)
-        self.base_ws_z = (0.05, 0.80)  # workspace z bounds (m); upper bound must exceed lift_z (object_init_z+0.6+0.003≈0.643m)
+        self.base_ws_z = (0.05, 0.80)  # workspace z bounds (m); upper bound must exceed lift_z (object_init_z+0.1+0.003≈0.143m)
 
     def _create_envs(self, num_envs, spacing, num_per_row):
         self._create_ground_plane()
@@ -305,6 +305,12 @@ class AllegroHandHora(VecTask):
         # linvel and angvel remain zero
         self.base_vel_prev = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
 
+        # 将 prev_targets / cur_targets 初始化为笼式预抓姿态（而非零向量），
+        # 确保第一个 episode 的手指从正确的抓取构型出发。
+        cage = self.allegro_hand_default_dof_pos
+        self.prev_targets[:, :self.num_allegro_hand_dofs] = cage.unsqueeze(0).expand(self.num_envs, -1)
+        self.cur_targets[:, :self.num_allegro_hand_dofs] = cage.unsqueeze(0).expand(self.num_envs, -1)
+
         # =========================================================================
         # �� 修复 2：获取手掌和指尖的刚体索引 (Rigid Body Indices)
         # 只需要在 envs[0] 中查一次，因为所有环境的内存拓扑布局是完全一致的
@@ -430,7 +436,7 @@ class AllegroHandHora(VecTask):
         target_pos = torch.zeros_like(self.object_pos)
         target_pos[:, 0] = self.object_init_state[:, 0]
         target_pos[:, 1] = self.object_init_state[:, 1]
-        target_pos[:, 2] = self.object_init_state[:, 2] + 0.6  # 对齐 lift_z = object_init_z + 0.6
+        target_pos[:, 2] = self.object_init_state[:, 2] + 0.15  # 目标高度：球初始高度 + 0.15m（可达）
 
         # ==========================================
         # 3. 调用奖励引擎 (对齐 UniDexGrasp2 else 分支，无 delta_value)
@@ -703,8 +709,11 @@ class AllegroHandHora(VecTask):
 
     def _setup_reward_config(self, r_config):
         # 保留方法以与其他 _setup_* 方法保持一致的初始化模式
-        # 奖励阈值已内置在 compute_hand_reward JIT 函数中 (对齐 UniDexGrasp2 else 分支):
-        #   finger_dist <= 0.6, hand_dist <= 0.12, lift_z = object_init_z + 0.6 + 0.003
+        # 奖励阈值已内置在 compute_hand_reward JIT 函数中:
+        #   approach_rew: hand_dist < 0.3 时线性正奖励（稠密接近奖励）
+        #   flag gate: finger_dist <= 0.6, hand_dist <= 0.12
+        #   lift_z = object_init_z + 0.1 + 0.003（目标抬升高度 ≈ 0.143m）
+        #   target_pos.z = object_init_z + 0.15（目标位置高度 ≈ 0.19m）
         pass
 
     def _create_object_asset(self):
@@ -739,9 +748,9 @@ class AllegroHandHora(VecTask):
         # 【修改】将机械手掌心初始化在 0.2m 高空
         allegro_hand_start_pose.p = gymapi.Vec3(0.0, 0.0, 0.2) 
         
-        # --- 【关键修正：将掌心旋转至垂直向下】 ---
-        # 绕 X 轴旋转 pi/2，让 Allegro 手的掌心正对地面 (-Z 方向)
-        allegro_hand_start_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi / 2)
+        # 绕 X 轴旋转 pi，让 Allegro 手的掌心正对地面 (-Z 方向)
+        # R_x(pi) 将本体 +Z 轴映射到世界 -Z 轴，即指尖朝下，掌心朝地
+        allegro_hand_start_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi)
 
         object_start_pose = gymapi.Transform()
         # 【修正】Vec3 只能接收 3 个参数 (x, y, z)，设置球在桌面的高度为 0.04m
@@ -792,15 +801,21 @@ def compute_hand_reward(
     finger_dist = torch.where(finger_dist >= 2.0, 2.0 + 0 * finger_dist, finger_dist)
 
     # ==========================================
-    # 2. 状态机门控逻辑与奖励 (0.6 与 0.12 阈值)
+    # 2. 状态机门控逻辑与奖励
     # ==========================================
     flag = (finger_dist <= 0.6).int() + (hand_dist <= 0.12).int()
 
     lowest = object_pos[:, 2]
-    lift_z = object_init_z + 0.6 + 0.003
+    lift_z = object_init_z + 0.1 + 0.003  # 抬升阈值：球初始高度 + 0.1m（可达）
+
+    # 稠密接近奖励：鼓励手掌靠近球（无需 flag 门控）
+    approach_rew = torch.clamp(0.3 - hand_dist, min=0.0) * 2.0
 
     goal_hand_rew = torch.zeros_like(finger_dist)
+    # flag==2：手掌和指尖都接近球，给满额奖励
     goal_hand_rew = torch.where(flag == 2, torch.clamp(1.0 * (0.9 - 2.0 * goal_dist), min=0.0), goal_hand_rew)
+    # flag==1：仅满足一个条件，给半额奖励（提供中间梯度）
+    goal_hand_rew = torch.where(flag == 1, torch.clamp(0.5 * (0.9 - 2.0 * goal_dist), min=0.0), goal_hand_rew)
 
     hand_up = torch.zeros_like(finger_dist)
     hand_up = torch.where(lowest >= lift_z, torch.where(flag == 2, 0.1 + 0.1 * actions[:, 2], hand_up), hand_up)
@@ -810,9 +825,9 @@ def compute_hand_reward(
     bonus = torch.where(flag == 2, torch.where(goal_dist <= 0.05, 1.0 / (1.0 + 10.0 * goal_dist), bonus), bonus)
 
     # ==========================================
-    # 3. 汇总总分 (对齐 UniDexGrasp2 else 分支，不扣 delta_value)
+    # 3. 汇总总分
     # ==========================================
-    reward = -0.5 * finger_dist - 1.0 * hand_dist + goal_hand_rew + hand_up + bonus
+    reward = -0.5 * finger_dist - 1.0 * hand_dist + approach_rew + goal_hand_rew + hand_up + bonus
 
     resets = torch.where(lowest < reset_z_threshold, torch.ones_like(reset_buf), reset_buf)
     resets = torch.where(progress_buf >= max_episode_length, torch.ones_like(resets), resets)
