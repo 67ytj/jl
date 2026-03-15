@@ -10,7 +10,7 @@ import torch
 import numpy as np
 from isaacgym import gymtorch
 from isaacgym import gymapi
-from isaacgym.torch_utils import to_torch, unscale, quat_apply, tensor_clamp, torch_rand_float, quat_conjugate, quat_mul
+from isaacgym.torch_utils import to_torch, unscale, quat_apply, tensor_clamp, torch_rand_float
 from glob import glob
 from hora.utils.misc import tprint
 from .base.vec_task import VecTask
@@ -419,39 +419,26 @@ class AllegroHandHora(VecTask):
         # 1. 提取物理位置和旋转
         # ==========================================
         palm_pos = self.rigid_body_states[:, self.hand_base_rigid_body_index, 0:3]
-        palm_rot = self.rigid_body_states[:, self.hand_base_rigid_body_index, 3:7]  # 获取手掌旋转
         ff_pos = self.rigid_body_states[:, self.ff_idx, 0:3]
         mf_pos = self.rigid_body_states[:, self.mf_idx, 0:3]
         rf_pos = self.rigid_body_states[:, self.rf_idx, 0:3]
         th_pos = self.rigid_body_states[:, self.th_idx, 0:3]
 
+        # ==========================================
+        # 2. 构造抬升目标位置 (对齐 UniDexGrasp2 else 分支)
+        # ==========================================
         target_pos = torch.zeros_like(self.object_pos)
         target_pos[:, 0] = self.object_init_state[:, 0]
         target_pos[:, 1] = self.object_init_state[:, 1]
         target_pos[:, 2] = self.object_init_state[:, 2] + 0.6  # 对齐 lift_z = object_init_z + 0.6
 
         # ==========================================
-        # 2. 构造你的“手工专家先验数据” (代替 Uni 的数据集)
-        # ==========================================
-        # (A) 手指关节误差 (16维专家姿态差)
-        expert_qpos = self.allegro_hand_default_dof_pos.repeat(self.num_envs, 1)
-        delta_qpos = self.allegro_hand_dof_pos - expert_qpos
-
-        # (B) 手掌相对位置误差 (已废弃，保留参数占位)
-        delta_target_hand_pos = torch.zeros_like(palm_pos)  # 已废弃，保留参数占位
-
-        # (C) 手掌旋转误差 (要求手掌保持初始向下的旋转状态)
-        ideal_hand_rot = self.hand_start_states[:, 3:7]  # 读取初始手掌朝向
-        delta_target_hand_rot = quat_mul(palm_rot, quat_conjugate(ideal_hand_rot))
-
-        # ==========================================
-        # 3. 调用底层的算分引擎 (传入三个 delta)
+        # 3. 调用奖励引擎 (对齐 UniDexGrasp2 else 分支，无 delta_value)
         # ==========================================
         self.rew_buf[:], self.reset_buf[:] = compute_hand_reward(
             self.object_init_state[:, 2], self.reset_buf, self.progress_buf, self.max_episode_length,
             self.object_pos, palm_pos, ff_pos, mf_pos, rf_pos, th_pos, target_pos, actions,
             self.reset_z_threshold,
-            delta_qpos, delta_target_hand_pos, delta_target_hand_rot  # <--- 将算好的先验误差传进去
         )
 
         # ==========================================
@@ -715,13 +702,10 @@ class AllegroHandHora(VecTask):
         self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, 32), device=self.device, dtype=torch.float)
 
     def _setup_reward_config(self, r_config):
-        self.angvel_clip_min = r_config['angvelClipMin']
-        self.angvel_clip_max = r_config['angvelClipMax']
-        self.rotate_reward_scale = r_config['rotateRewardScale']
-        self.object_linvel_penalty_scale = r_config['objLinvelPenaltyScale']
-        self.pose_diff_penalty_scale = r_config.get('poseDiffPenaltyScale', r_config.get('pose_diff_penalty_scale', -0.3))
-        self.torque_penalty_scale = r_config['torquePenaltyScale']
-        self.work_penalty_scale = r_config['workPenaltyScale']
+        # 保留方法以与其他 _setup_* 方法保持一致的初始化模式
+        # 奖励阈值已内置在 compute_hand_reward JIT 函数中 (对齐 UniDexGrasp2 else 分支):
+        #   finger_dist <= 0.6, hand_dist <= 0.12, lift_z = object_init_z + 0.6 + 0.003
+        pass
 
     def _create_object_asset(self):
         # object file to asset
@@ -789,7 +773,6 @@ def compute_hand_reward(
         object_pos: torch.Tensor, palm_pos: torch.Tensor,
         ff_pos: torch.Tensor, mf_pos: torch.Tensor, rf_pos: torch.Tensor, th_pos: torch.Tensor,
         target_pos: torch.Tensor, actions: torch.Tensor, reset_z_threshold: float,
-        delta_qpos: torch.Tensor, delta_target_hand_pos: torch.Tensor, delta_target_hand_rot: torch.Tensor
 ):
     # ==========================================
     # 1. 基础物理距离计算
