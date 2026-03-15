@@ -147,7 +147,7 @@ class AllegroHandHora(VecTask):
         self.base_max_speed = 0.5   # maximum translation speed (m/s)
         self.base_ws_x = (-0.3, 0.3)   # workspace x bounds (m)
         self.base_ws_y = (-0.3, 0.3)   # workspace y bounds (m)
-        self.base_ws_z = (0.05, 0.50)  # workspace z bounds (m)
+        self.base_ws_z = (0.05, 0.80)  # workspace z bounds (m); upper bound must exceed lift_z (object_init_z+0.6+0.003≈0.643m)
 
     def _create_envs(self, num_envs, spacing, num_per_row):
         self._create_ground_plane()
@@ -800,7 +800,7 @@ def compute_hand_reward(
     lift_z = object_init_z + 0.6 + 0.003
 
     goal_hand_rew = torch.zeros_like(finger_dist)
-    goal_hand_rew = torch.where(flag == 2, 1.0 * (0.9 - 2.0 * goal_dist), goal_hand_rew)
+    goal_hand_rew = torch.where(flag == 2, torch.clamp(1.0 * (0.9 - 2.0 * goal_dist), min=0.0), goal_hand_rew)
 
     hand_up = torch.zeros_like(finger_dist)
     hand_up = torch.where(lowest >= lift_z, torch.where(flag == 2, 0.1 + 0.1 * actions[:, 2], hand_up), hand_up)
