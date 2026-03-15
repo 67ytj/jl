@@ -141,7 +141,14 @@ class AllegroHandHora(VecTask):
         self.num_actions = 19
         self.act_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(self.num_actions,)) # <--- 换成 act_space！
         self.actions = torch.zeros((self.num_envs, self.num_actions), dtype=torch.float, device=self.device, requires_grad=False)
-    
+
+        # base velocity control parameters
+        self.base_ema_alpha = 0.7   # EMA smoothing coefficient (0=no smoothing, 1=pure integration)
+        self.base_max_speed = 0.5   # maximum translation speed (m/s)
+        self.base_ws_x = (-0.3, 0.3)   # workspace x bounds (m)
+        self.base_ws_y = (-0.3, 0.3)   # workspace y bounds (m)
+        self.base_ws_z = (0.05, 0.50)  # workspace z bounds (m)
+
     def _create_envs(self, num_envs, spacing, num_per_row):
         self._create_ground_plane()
         lower = gymapi.Vec3(-spacing, -spacing, 0.0)
@@ -290,6 +297,15 @@ class AllegroHandHora(VecTask):
         self.hand_start_states[:, 3:7] = initial_hand_quat.unsqueeze(0).repeat(self.num_envs, 1)
 
         # =========================================================================
+        # 缓存 hand 的完整初始 root state (13维)，用于 reset + 速度控制闭环
+        # =========================================================================
+        self.hand_init_state = torch.zeros((self.num_envs, 13), device=self.device, dtype=torch.float)
+        self.hand_init_state[:, 0:3] = self.hand_start_states[:, 0:3]   # pos
+        self.hand_init_state[:, 3:7] = self.hand_start_states[:, 3:7]   # quat
+        # linvel and angvel remain zero
+        self.base_vel_prev = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
+
+        # =========================================================================
         # �� 修复 2：获取手掌和指尖的刚体索引 (Rigid Body Indices)
         # 只需要在 envs[0] 中查一次，因为所有环境的内存拓扑布局是完全一致的
         # =========================================================================
@@ -341,16 +357,12 @@ class AllegroHandHora(VecTask):
         self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.root_state_tensor), gymtorch.unwrap_tensor(object_indices), len(object_indices))
 
         # --- 【重置手掌 Base 的世界坐标位置】 ---
-        # 手掌通过外力驱动（apply_forces），episode 结束时可能飞到任何位置
-        # 必须把 root_state 里手的位置/速度重置回初始值，否则下一个 episode 从随机位置开始
         hand_root_indices = self.hand_indices[env_ids]
-        self.root_state_tensor[hand_root_indices, 0] = 0.0   # x
-        self.root_state_tensor[hand_root_indices, 1] = 0.0   # y
-        self.root_state_tensor[hand_root_indices, 2] = 0.2   # z（初始高度）
-        # 保留初始旋转（从 hand_start_states 读取）
-        self.root_state_tensor[hand_root_indices, 3:7] = self.hand_start_states[env_ids, 3:7]
-        # 清零线速度和角速度
-        self.root_state_tensor[hand_root_indices, 7:13] = 0.0
+
+        # 直接恢复完整 13 维 root state（pos/quat/linvel/angvel）
+        self.root_state_tensor[hand_root_indices, :] = self.hand_init_state[env_ids].clone()
+        # 同步清零速度 EMA 缓存，避免 reset 后第一步被拉回旧速度
+        self.base_vel_prev[env_ids] = 0.0
 
         # 将手掌位置写入仿真器（hand_indices 和 object_indices 分开写）
         hand_root_indices_int32 = hand_root_indices.to(torch.int32)
@@ -496,15 +508,10 @@ class AllegroHandHora(VecTask):
         # =========================================================
         # ��️ 补丁 C：终极拦截器 (化解 Dummy Step 的 16 维空动作)
         # =========================================================
-        if actions.shape[1] == 16:
-            padded_actions = torch.zeros((actions.shape[0], 19), device=actions.device, dtype=actions.dtype)
-            padded_actions[:, 3:19] = actions  # 把 16 维动作放到手指的位置
-            actions = padded_actions  # 替换成完美的 19 维
+        assert actions.shape[1] == 19, f"Expected 19-dim actions [base(3)+finger(16)], got {actions.shape}"
         # =========================================================
 
         self.actions = actions.clone().to(self.device)
-
-
 
         # ==========================================
         # 1. 拦截与分流 (Action Splitting)
@@ -526,24 +533,36 @@ class AllegroHandHora(VecTask):
         self.object_pos_prev[:] = self.object_pos
 
         # ==========================================
-        # 3. 控制手掌底座移动 (复刻 UniDexGrasp 推进器)
+        # 3. 控制手掌底座移动（速度控制 + root state 积分 + workspace clamp + EMA 平滑）
         # ==========================================
-        # 为了不每一帧都申请显存，我们做个安全检查，初始化一个力向量表
-        if not hasattr(self, 'apply_forces_buf'):
-            # 形状：[环境数量, 刚体数量, 3维力(x,y,z)]
-            self.apply_forces_buf = torch.zeros((self.num_envs, self.num_bodies, 3), device=self.device,
-                                                dtype=torch.float)
+        # 将 [-1,1] 的动作缩放为速度 (m/s)
+        vel_cmd = base_actions * self.base_max_speed
+        # EMA 平滑
+        smoothed_vel = self.base_ema_alpha * self.base_vel_prev + (1.0 - self.base_ema_alpha) * vel_cmd
+        self.base_vel_prev[:] = smoothed_vel
 
-        # 每一帧开始前，清空上一帧残留的力
-        self.apply_forces_buf[:] = 0.0
+        # 读取当前手掌位置并积分
+        hand_root_indices = self.hand_indices  # shape: (num_envs,)
+        cur_pos = self.root_state_tensor[hand_root_indices, 0:3].clone()
+        new_pos = cur_pos + smoothed_vel * self.dt
 
-        # 【核心施力】：将 AI 输出的前 3 维动作转化为巨大的推力
-        # 10000.0 是力的放大系数。如果手飞得太慢，可以调成 20000；如果乱飞，可以调成 5000。
-        self.apply_forces_buf[:, self.hand_base_rigid_body_index, :] = base_actions * 10000.0
+        # workspace clamp
+        new_pos[:, 0] = torch.clamp(new_pos[:, 0], self.base_ws_x[0], self.base_ws_x[1])
+        new_pos[:, 1] = torch.clamp(new_pos[:, 1], self.base_ws_y[0], self.base_ws_y[1])
+        new_pos[:, 2] = torch.clamp(new_pos[:, 2], self.base_ws_z[0], self.base_ws_z[1])
 
-        # 将力表注入物理引擎
-        self.gym.apply_rigid_body_force_tensors(self.sim, gymtorch.unwrap_tensor(self.apply_forces_buf), None,
-                                                gymapi.ENV_SPACE)
+        # 写回 root state tensor（位置 + 线速度）
+        self.root_state_tensor[hand_root_indices, 0:3] = new_pos
+        self.root_state_tensor[hand_root_indices, 7:10] = smoothed_vel
+
+        # 推送到仿真器
+        hand_root_indices_int32 = hand_root_indices.to(torch.int32)
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.root_state_tensor),
+            gymtorch.unwrap_tensor(hand_root_indices_int32),
+            len(hand_root_indices_int32)
+        )
 
         # ==========================================
         # 4. 保留原有的随机扰动力逻辑 (Domain Randomization)
@@ -711,7 +730,7 @@ class AllegroHandHora(VecTask):
         # load hand asset
         hand_asset_options = gymapi.AssetOptions()
         hand_asset_options.flip_visual_attachments = False
-        hand_asset_options.fix_base_link = True
+        hand_asset_options.fix_base_link = False
         hand_asset_options.collapse_fixed_joints = True
         hand_asset_options.disable_gravity = True
         hand_asset_options.thickness = 0.001
