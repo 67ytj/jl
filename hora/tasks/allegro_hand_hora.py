@@ -358,25 +358,23 @@ class AllegroHandHora(VecTask):
 
         # --- 【物理引擎同步】 ---
 
-        # 6. 将更新后的物体位置写入仿真器
-        object_indices = torch.unique(self.object_indices[env_ids]).to(torch.int32)
-        self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.root_state_tensor), gymtorch.unwrap_tensor(object_indices), len(object_indices))
-
-        # --- 【重置手掌 Base 的世界坐标位置】 ---
+        # 6. 重置手掌 Base 的世界坐标位置
         hand_root_indices = self.hand_indices[env_ids]
-
         # 直接恢复完整 13 维 root state（pos/quat/linvel/angvel）
         self.root_state_tensor[hand_root_indices, :] = self.hand_init_state[env_ids].clone()
         # 同步清零速度 EMA 缓存，避免 reset 后第一步被拉回旧速度
         self.base_vel_prev[env_ids] = 0.0
 
-        # 将手掌位置写入仿真器（hand_indices 和 object_indices 分开写）
+        # 将物体和手掌的 root state 合并到一次 API 调用中写入仿真器，
+        # 避免两次分开调用在 GPU pipeline 中产生竞态条件。
+        object_indices = torch.unique(self.object_indices[env_ids]).to(torch.int32)
         hand_root_indices_int32 = hand_root_indices.to(torch.int32)
+        all_indices = torch.cat([object_indices, hand_root_indices_int32])
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(self.root_state_tensor),
-            gymtorch.unwrap_tensor(hand_root_indices_int32),
-            len(hand_root_indices_int32)
+            gymtorch.unwrap_tensor(all_indices),
+            len(all_indices)
         )
 
         # 7. 将更新后的机械手姿态写入仿真器
@@ -549,16 +547,20 @@ class AllegroHandHora(VecTask):
         # 读取当前手掌位置并积分
         hand_root_indices = self.hand_indices  # shape: (num_envs,)
         cur_pos = self.root_state_tensor[hand_root_indices, 0:3].clone()
-        new_pos = cur_pos + smoothed_vel * self.dt
+        # 使用完整的 RL 时间步长 (control_freq_inv * dt) 进行积分，
+        # 然后通过 set_actor_root_state_tensor_indexed 直接设置位置（速度归零），
+        # 避免手动积分与物理引擎速度积分的双重计算。
+        rl_dt = self.dt * self.control_freq_inv
+        new_pos = cur_pos + smoothed_vel * rl_dt
 
         # workspace clamp
         new_pos[:, 0] = torch.clamp(new_pos[:, 0], self.base_ws_x[0], self.base_ws_x[1])
         new_pos[:, 1] = torch.clamp(new_pos[:, 1], self.base_ws_y[0], self.base_ws_y[1])
         new_pos[:, 2] = torch.clamp(new_pos[:, 2], self.base_ws_z[0], self.base_ws_z[1])
 
-        # 写回 root state tensor（位置 + 线速度）
+        # 写回 root state tensor（位置直接设置，线速度归零以避免物理引擎再次积分）
         self.root_state_tensor[hand_root_indices, 0:3] = new_pos
-        self.root_state_tensor[hand_root_indices, 7:10] = smoothed_vel
+        self.root_state_tensor[hand_root_indices, 7:10] = 0.0
 
         # 推送到仿真器
         hand_root_indices_int32 = hand_root_indices.to(torch.int32)

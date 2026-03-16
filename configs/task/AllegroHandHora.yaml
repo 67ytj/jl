@@ -3,7 +3,7 @@ physics_engine: ${..physics_engine}
 on_evaluation: False
 
 env:
-  numEnvs: ${resolve_default:64,${...num_envs}}
+  numEnvs: ${resolve_default:1024,${...num_envs}}
   numObservations: 102  # 96 (3×32 joint lag history) + 6 (palm_pos + ball_rel_pos)
   numActions: 19 #【修改这里】从 16 改为 19,这多出来的 3 个维度将作为 $X, Y, Z$ 方向的推力。
   envSpacing: 0.5 
@@ -91,7 +91,7 @@ sim:
     solver_type: ${....solver_type}
     use_gpu: ${contains:'cuda',${....sim_device}}
     num_position_iterations: 8
-    num_velocity_iterations: 0
+    num_velocity_iterations: 1
     max_gpu_contact_pairs: 8388608
     num_subscenes: ${....num_subscenes}
     contact_offset: 0.002
