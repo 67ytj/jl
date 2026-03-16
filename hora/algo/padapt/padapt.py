@@ -140,7 +140,7 @@ class ProprioAdapt(object):
                 self.save(os.path.join(self.nn_dir, f'model_last'))
 
             mean_rewards = self.mean_eps_reward.get_mean()
-            if mean_rewards > self.best_rewards:
+            if self.mean_eps_reward.current_size > 0 and mean_rewards > self.best_rewards:
                 self.save(os.path.join(self.nn_dir, f'model_best'))
                 self.best_rewards = mean_rewards
 
@@ -149,6 +149,7 @@ class ProprioAdapt(object):
             _last_t = time.time()
             info_string = f'Agent Steps: {int(self.agent_steps // 1e6):04}M | FPS: {all_fps:.1f} | ' \
                           f'Last FPS: {last_fps:.1f} | ' \
+                          f'Current Reward: {mean_rewards:.2f} | ' \
                           f'Current Best: {self.best_rewards:.2f}'
             tprint(info_string)
 

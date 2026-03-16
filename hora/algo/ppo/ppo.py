@@ -173,16 +173,17 @@ class PPO(object):
             all_fps = self.agent_steps / (time.time() - _t)
             last_fps = self.batch_size / (time.time() - _last_t)
             _last_t = time.time()
+            mean_rewards = self.episode_rewards.get_mean()
             info_string = f'Agent Steps: {int(self.agent_steps // 1e6):04}M | FPS: {all_fps:.1f} | ' \
                           f'Last FPS: {last_fps:.1f} | ' \
                           f'Collect Time: {self.data_collect_time / 60:.1f} min | ' \
                           f'Train RL Time: {self.rl_train_time / 60:.1f} min | ' \
+                          f'Current Reward: {mean_rewards:.2f} | ' \
                           f'Current Best: {self.best_rewards:.2f}'
             print(info_string)
 
             self.write_stats(a_losses, c_losses, b_losses, entropies, kls)
 
-            mean_rewards = self.episode_rewards.get_mean()
             mean_lengths = self.episode_lengths.get_mean()
             self.writer.add_scalar('episode_rewards/step', mean_rewards, self.agent_steps)
             self.writer.add_scalar('episode_lengths/step', mean_lengths, self.agent_steps)
@@ -193,7 +194,7 @@ class PPO(object):
                     self.save(os.path.join(self.nn_dir, checkpoint_name))
                     self.save(os.path.join(self.nn_dir, 'last'))
 
-            if mean_rewards > self.best_rewards and self.epoch_num >= self.save_best_after:
+            if self.episode_rewards.current_size > 0 and mean_rewards > self.best_rewards and self.epoch_num >= self.save_best_after:
                 print(f'save current best reward: {mean_rewards:.2f}')
                 self.best_rewards = mean_rewards
                 self.save(os.path.join(self.nn_dir, 'best'))
