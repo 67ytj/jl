@@ -417,6 +417,18 @@ class AllegroHandHora(VecTask):
         self.obs_buf[:, :t_buf.shape[1]] = t_buf
         self.at_reset_buf[at_reset_env_ids] = 0
 
+        # -----------------------------------------------------------------------
+        # 空间观测（追加到关节 lag history 之后）
+        # 作用：让策略网络能"看到"手掌在哪里、球在哪里，
+        #       从而学习用基座速度动作（action[0:3]）向球靠近
+        # obs[:, 96:99] = palm_pos          手掌基座世界坐标
+        # obs[:, 99:102] = object_pos - palm_pos  球相对手掌的位移向量
+        # -----------------------------------------------------------------------
+        palm_pos_obs = self.rigid_body_states[:, self.hand_base_rigid_body_index, 0:3]
+        rel_pos_obs = self.object_pos - palm_pos_obs
+        self.obs_buf[:, 96:99] = palm_pos_obs
+        self.obs_buf[:, 99:102] = rel_pos_obs
+
         self.proprio_hist_buf[:] = self.obs_buf_lag_history[:, -self.prop_hist_len:].clone()
         self._update_priv_buf(env_id=range(self.num_envs), name='obj_position', value=self.object_pos.clone())
 
@@ -706,6 +718,14 @@ class AllegroHandHora(VecTask):
         self.num_env_factors = self.config['env']['hora']['privInfoDim']
         self.priv_info_buf = torch.zeros((num_envs, self.num_env_factors), device=self.device, dtype=torch.float)
         self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, 32), device=self.device, dtype=torch.float)
+
+        # 覆盖 VecTask 中按 num_obs//3 分配的 lag history，固定为 32 维
+        # (16 关节位置 + 16 关节目标)，与 numObservations 解耦，
+        # 使 obs_buf 剩余维度可用于追加空间观测（手掌位置、球相对位置）
+        # 80 = VecTask._allocate_buffers 中的 lag history 容量（最近 80 步）
+        self.obs_buf_lag_history = torch.zeros(
+            (num_envs, 80, 32), device=self.device, dtype=torch.float
+        )
 
     def _setup_reward_config(self, r_config):
         # 保留方法以与其他 _setup_* 方法保持一致的初始化模式
