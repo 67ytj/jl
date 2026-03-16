@@ -4,7 +4,7 @@ on_evaluation: False
 
 env:
   numEnvs: ${resolve_default:64,${...num_envs}}
-  numObservations: 96
+  numObservations: 102  # 96 (3×32 joint lag history) + 6 (palm_pos + ball_rel_pos)
   numActions: 19 #【修改这里】从 16 改为 19,这多出来的 3 个维度将作为 $X, Y, Z$ 方向的推力。
   envSpacing: 0.5 
   episodeLength: 400

@@ -143,11 +143,11 @@ class AllegroHandHora(VecTask):
         self.actions = torch.zeros((self.num_envs, self.num_actions), dtype=torch.float, device=self.device, requires_grad=False)
 
         # base velocity control parameters
-        self.base_ema_alpha = 0.7   # EMA smoothing coefficient (0=no smoothing, 1=pure integration)
+        self.base_ema_alpha = 0.5   # EMA smoothing coefficient (0=no smoothing, 1=pure integration); 0.5 provides faster response than 0.7
         self.base_max_speed = 0.5   # maximum translation speed (m/s)
         self.base_ws_x = (-0.3, 0.3)   # workspace x bounds (m)
         self.base_ws_y = (-0.3, 0.3)   # workspace y bounds (m)
-        self.base_ws_z = (0.05, 0.80)  # workspace z bounds (m); upper bound must exceed lift_z (object_init_z+0.6+0.003≈0.643m)
+        self.base_ws_z = (0.05, 0.80)  # workspace z bounds (m); upper bound must exceed lift_z (object_init_z+0.1+0.003≈0.143m)
 
     def _create_envs(self, num_envs, spacing, num_per_row):
         self._create_ground_plane()
@@ -293,7 +293,7 @@ class AllegroHandHora(VecTask):
         self.hand_start_states = torch.zeros((self.num_envs, 7), device=self.device, dtype=torch.float)
         self.hand_start_states[:, 0] = 0.0   # x
         self.hand_start_states[:, 1] = 0.0   # y
-        self.hand_start_states[:, 2] = 0.2   # z（与 _init_object_pose 里的初始高度一致）
+        self.hand_start_states[:, 2] = 0.15  # z（与 _init_object_pose 里的初始高度一致）
         self.hand_start_states[:, 3:7] = initial_hand_quat.unsqueeze(0).repeat(self.num_envs, 1)
 
         # =========================================================================
@@ -304,6 +304,12 @@ class AllegroHandHora(VecTask):
         self.hand_init_state[:, 3:7] = self.hand_start_states[:, 3:7]   # quat
         # linvel and angvel remain zero
         self.base_vel_prev = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
+
+        # 将 prev_targets / cur_targets 初始化为笼式预抓姿态（而非零向量），
+        # 确保第一个 episode 的手指从正确的抓取构型出发。
+        cage = self.allegro_hand_default_dof_pos
+        self.prev_targets[:, :self.num_allegro_hand_dofs] = cage.unsqueeze(0).expand(self.num_envs, -1)
+        self.cur_targets[:, :self.num_allegro_hand_dofs] = cage.unsqueeze(0).expand(self.num_envs, -1)
 
         # =========================================================================
         # �� 修复 2：获取手掌和指尖的刚体索引 (Rigid Body Indices)
@@ -411,6 +417,18 @@ class AllegroHandHora(VecTask):
         self.obs_buf[:, :t_buf.shape[1]] = t_buf
         self.at_reset_buf[at_reset_env_ids] = 0
 
+        # -----------------------------------------------------------------------
+        # 空间观测（追加到关节 lag history 之后）
+        # 作用：让策略网络能"看到"手掌在哪里、球在哪里，
+        #       从而学习用基座速度动作（action[0:3]）向球靠近
+        # obs[:, 96:99] = palm_pos          手掌基座世界坐标
+        # obs[:, 99:102] = object_pos - palm_pos  球相对手掌的位移向量
+        # -----------------------------------------------------------------------
+        palm_pos_obs = self.rigid_body_states[:, self.hand_base_rigid_body_index, 0:3]
+        rel_pos_obs = self.object_pos - palm_pos_obs
+        self.obs_buf[:, 96:99] = palm_pos_obs
+        self.obs_buf[:, 99:102] = rel_pos_obs
+
         self.proprio_hist_buf[:] = self.obs_buf_lag_history[:, -self.prop_hist_len:].clone()
         self._update_priv_buf(env_id=range(self.num_envs), name='obj_position', value=self.object_pos.clone())
 
@@ -430,7 +448,7 @@ class AllegroHandHora(VecTask):
         target_pos = torch.zeros_like(self.object_pos)
         target_pos[:, 0] = self.object_init_state[:, 0]
         target_pos[:, 1] = self.object_init_state[:, 1]
-        target_pos[:, 2] = self.object_init_state[:, 2] + 0.6  # 对齐 lift_z = object_init_z + 0.6
+        target_pos[:, 2] = self.object_init_state[:, 2] + 0.15  # 目标高度：球初始高度 + 0.15m（可达）
 
         # ==========================================
         # 3. 调用奖励引擎 (对齐 UniDexGrasp2 else 分支，无 delta_value)
@@ -701,10 +719,21 @@ class AllegroHandHora(VecTask):
         self.priv_info_buf = torch.zeros((num_envs, self.num_env_factors), device=self.device, dtype=torch.float)
         self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, 32), device=self.device, dtype=torch.float)
 
+        # 覆盖 VecTask 中按 num_obs//3 分配的 lag history，固定为 32 维
+        # (16 关节位置 + 16 关节目标)，与 numObservations 解耦，
+        # 使 obs_buf 剩余维度可用于追加空间观测（手掌位置、球相对位置）
+        # 80 = VecTask._allocate_buffers 中的 lag history 容量（最近 80 步）
+        self.obs_buf_lag_history = torch.zeros(
+            (num_envs, 80, 32), device=self.device, dtype=torch.float
+        )
+
     def _setup_reward_config(self, r_config):
         # 保留方法以与其他 _setup_* 方法保持一致的初始化模式
-        # 奖励阈值已内置在 compute_hand_reward JIT 函数中 (对齐 UniDexGrasp2 else 分支):
-        #   finger_dist <= 0.6, hand_dist <= 0.12, lift_z = object_init_z + 0.6 + 0.003
+        # 奖励阈值已内置在 compute_hand_reward JIT 函数中:
+        #   approach_rew: hand_dist < 0.3 时线性正奖励（稠密接近奖励）
+        #   flag gate: finger_dist <= 0.6, hand_dist <= 0.12
+        #   lift_z = object_init_z + 0.1 + 0.003（目标抬升高度 ≈ 0.143m）
+        #   target_pos.z = object_init_z + 0.15（目标位置高度 ≈ 0.19m）
         pass
 
     def _create_object_asset(self):
@@ -736,12 +765,12 @@ class AllegroHandHora(VecTask):
 
     def _init_object_pose(self):
         allegro_hand_start_pose = gymapi.Transform()
-        # 【修改】将机械手掌心初始化在 0.2m 高空
-        allegro_hand_start_pose.p = gymapi.Vec3(0.0, 0.0, 0.2) 
+        # 手掌初始高度 0.15m：掌心在球（z=0.04m）上方约 11cm，指尖约在球顶部（z≈0.05m），处于抓取区域
+        allegro_hand_start_pose.p = gymapi.Vec3(0.0, 0.0, 0.15)
         
-        # --- 【关键修正：将掌心旋转至垂直向下】 ---
-        # 绕 X 轴旋转 pi/2，让 Allegro 手的掌心正对地面 (-Z 方向)
-        allegro_hand_start_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi / 2)
+        # 绕 X 轴旋转 pi，让 Allegro 手的掌心正对地面 (-Z 方向)
+        # R_x(pi) 将本体 +Z 轴映射到世界 -Z 轴，即指尖朝下，掌心朝地
+        allegro_hand_start_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi)
 
         object_start_pose = gymapi.Transform()
         # 【修正】Vec3 只能接收 3 个参数 (x, y, z)，设置球在桌面的高度为 0.04m
@@ -792,15 +821,21 @@ def compute_hand_reward(
     finger_dist = torch.where(finger_dist >= 2.0, 2.0 + 0 * finger_dist, finger_dist)
 
     # ==========================================
-    # 2. 状态机门控逻辑与奖励 (0.6 与 0.12 阈值)
+    # 2. 状态机门控逻辑与奖励
     # ==========================================
     flag = (finger_dist <= 0.6).int() + (hand_dist <= 0.12).int()
 
     lowest = object_pos[:, 2]
-    lift_z = object_init_z + 0.6 + 0.003
+    lift_z = object_init_z + 0.1 + 0.003  # 抬升阈值：球初始高度 + 0.1m（可达）
+
+    # 稠密接近奖励：鼓励手掌靠近球（无需 flag 门控）
+    approach_rew = torch.clamp(0.3 - hand_dist, min=0.0) * 2.0
 
     goal_hand_rew = torch.zeros_like(finger_dist)
+    # flag==2：手掌和指尖都接近球，给满额奖励
     goal_hand_rew = torch.where(flag == 2, torch.clamp(1.0 * (0.9 - 2.0 * goal_dist), min=0.0), goal_hand_rew)
+    # flag==1：仅满足一个条件，给半额奖励（提供中间梯度）
+    goal_hand_rew = torch.where(flag == 1, torch.clamp(0.5 * (0.9 - 2.0 * goal_dist), min=0.0), goal_hand_rew)
 
     hand_up = torch.zeros_like(finger_dist)
     hand_up = torch.where(lowest >= lift_z, torch.where(flag == 2, 0.1 + 0.1 * actions[:, 2], hand_up), hand_up)
@@ -810,9 +845,9 @@ def compute_hand_reward(
     bonus = torch.where(flag == 2, torch.where(goal_dist <= 0.05, 1.0 / (1.0 + 10.0 * goal_dist), bonus), bonus)
 
     # ==========================================
-    # 3. 汇总总分 (对齐 UniDexGrasp2 else 分支，不扣 delta_value)
+    # 3. 汇总总分
     # ==========================================
-    reward = -0.5 * finger_dist - 1.0 * hand_dist + goal_hand_rew + hand_up + bonus
+    reward = -0.5 * finger_dist - 1.0 * hand_dist + approach_rew + goal_hand_rew + hand_up + bonus
 
     resets = torch.where(lowest < reset_z_threshold, torch.ones_like(reset_buf), reset_buf)
     resets = torch.where(progress_buf >= max_episode_length, torch.ones_like(resets), resets)
