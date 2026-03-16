@@ -81,6 +81,7 @@ class ProprioAdapt(object):
         batch_size = self.num_actors
         self.step_reward = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
         self.step_length = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
+        self._last_step_reward = 0
 
     def set_eval(self):
         self.model.eval()
@@ -121,6 +122,7 @@ class ProprioAdapt(object):
             mu = torch.clamp(mu, -1.0, 1.0)
             obs_dict, r, done, info = self.env.step(mu)
             self.agent_steps += self.batch_size
+            self._last_step_reward = r.mean().item()
 
             # ---- statistics
             self.step_reward += r
@@ -147,17 +149,30 @@ class ProprioAdapt(object):
             all_fps = self.agent_steps / (time.time() - _t)
             last_fps = self.batch_size / (time.time() - _last_t)
             _last_t = time.time()
+            step_rew_str = f'{r.mean().item():.4f}'
             reward_str = f'{mean_rewards:.2f}' if self.mean_eps_reward.current_size > 0 else 'N/A'
             best_str = f'{self.best_rewards:.2f}' if self.best_rewards > -10000 else 'N/A'
             info_string = f'Agent Steps: {int(self.agent_steps // 1e6):04}M | FPS: {all_fps:.1f} | ' \
                           f'Last FPS: {last_fps:.1f} | ' \
+                          f'Step Reward: {step_rew_str} | ' \
                           f'Current Reward: {reward_str} | ' \
                           f'Current Best: {best_str}'
+            if self.direct_info:
+                extra_parts = []
+                for k, v in self.direct_info.items():
+                    if isinstance(v, torch.Tensor):
+                        extra_parts.append(f'{k}: {v.item():.4f}')
+                    elif isinstance(v, float):
+                        extra_parts.append(f'{k}: {v:.4f}')
+                    else:
+                        extra_parts.append(f'{k}: {v}')
+                info_string += f' | {" | ".join(extra_parts)}'
             tprint(info_string)
 
     def log_tensorboard(self):
         self.writer.add_scalar('episode_rewards/step', self.mean_eps_reward.get_mean(), self.agent_steps)
         self.writer.add_scalar('episode_lengths/step', self.mean_eps_length.get_mean(), self.agent_steps)
+        self.writer.add_scalar('step_rewards/step', self._last_step_reward, self.agent_steps)
         for k, v in self.direct_info.items():
             self.writer.add_scalar(f'{k}/frame', v, self.agent_steps)
 

@@ -119,7 +119,7 @@ class PPO(object):
         self.rl_train_time = 0
         self.all_time = 0
 
-    def write_stats(self, a_losses, c_losses, b_losses, entropies, kls):
+    def write_stats(self, a_losses, c_losses, b_losses, entropies, kls, mean_step_reward=0):
         self.writer.add_scalar('performance/RLTrainFPS', self.agent_steps / self.rl_train_time, self.agent_steps)
         self.writer.add_scalar('performance/EnvStepFPS', self.agent_steps / self.data_collect_time, self.agent_steps)
 
@@ -131,6 +131,7 @@ class PPO(object):
         self.writer.add_scalar('info/last_lr', self.last_lr, self.agent_steps)
         self.writer.add_scalar('info/e_clip', self.e_clip, self.agent_steps)
         self.writer.add_scalar('info/kl', torch.mean(torch.stack(kls)).item(), self.agent_steps)
+        self.writer.add_scalar('step_rewards/step', mean_step_reward, self.agent_steps)
 
         for k, v in self.extra_info.items():
             self.writer.add_scalar(f'{k}', v, self.agent_steps)
@@ -174,17 +175,30 @@ class PPO(object):
             last_fps = self.batch_size / (time.time() - _last_t)
             _last_t = time.time()
             mean_rewards = self.episode_rewards.get_mean()
+            mean_step_reward = self.step_rewards_sum / self.horizon_length
             reward_str = f'{mean_rewards:.2f}' if self.episode_rewards.current_size > 0 else 'N/A'
+            step_rew_str = f'{mean_step_reward:.4f}'
             best_str = f'{self.best_rewards:.2f}' if self.best_rewards > -10000 else 'N/A'
             info_string = f'Agent Steps: {int(self.agent_steps // 1e6):04}M | FPS: {all_fps:.1f} | ' \
                           f'Last FPS: {last_fps:.1f} | ' \
                           f'Collect Time: {self.data_collect_time / 60:.1f} min | ' \
                           f'Train RL Time: {self.rl_train_time / 60:.1f} min | ' \
+                          f'Step Reward: {step_rew_str} | ' \
                           f'Current Reward: {reward_str} | ' \
                           f'Current Best: {best_str}'
+            if self.extra_info:
+                extra_parts = []
+                for k, v in self.extra_info.items():
+                    if isinstance(v, torch.Tensor):
+                        extra_parts.append(f'{k}: {v.item():.4f}')
+                    elif isinstance(v, float):
+                        extra_parts.append(f'{k}: {v:.4f}')
+                    else:
+                        extra_parts.append(f'{k}: {v}')
+                info_string += f' | {" | ".join(extra_parts)}'
             print(info_string)
 
-            self.write_stats(a_losses, c_losses, b_losses, entropies, kls)
+            self.write_stats(a_losses, c_losses, b_losses, entropies, kls, mean_step_reward)
 
             mean_lengths = self.episode_lengths.get_mean()
             self.writer.add_scalar('episode_rewards/step', mean_rewards, self.agent_steps)
@@ -319,6 +333,7 @@ class PPO(object):
         return a_losses, c_losses, b_losses, entropies, kls
 
     def play_steps(self):
+        self.step_rewards_sum = 0
         for n in range(self.horizon_length):
             res_dict = self.model_act(self.obs)
             # collect o_t
@@ -339,6 +354,7 @@ class PPO(object):
 
             self.current_rewards += rewards
             self.current_lengths += 1
+            self.step_rewards_sum += rewards.mean().item()
             done_indices = self.dones.nonzero(as_tuple=False)
             self.episode_rewards.update(self.current_rewards[done_indices])
             self.episode_lengths.update(self.current_lengths[done_indices])
