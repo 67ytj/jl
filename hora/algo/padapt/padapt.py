@@ -160,7 +160,7 @@ class ProprioAdapt(object):
             if self.direct_info:
                 extra_parts = []
                 for k, v in self.direct_info.items():
-                    if hasattr(v, 'item'):
+                    if isinstance(v, torch.Tensor):
                         extra_parts.append(f'{k}: {v.item():.4f}')
                     elif isinstance(v, float):
                         extra_parts.append(f'{k}: {v:.4f}')
