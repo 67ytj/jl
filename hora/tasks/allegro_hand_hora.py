@@ -143,7 +143,7 @@ class AllegroHandHora(VecTask):
         self.actions = torch.zeros((self.num_envs, self.num_actions), dtype=torch.float, device=self.device, requires_grad=False)
 
         # base velocity control parameters
-        self.base_ema_alpha = 0.7   # EMA smoothing coefficient (0=no smoothing, 1=pure integration)
+        self.base_ema_alpha = 0.5   # EMA smoothing coefficient (0=no smoothing, 1=pure integration); 0.5 provides faster response than 0.7
         self.base_max_speed = 0.5   # maximum translation speed (m/s)
         self.base_ws_x = (-0.3, 0.3)   # workspace x bounds (m)
         self.base_ws_y = (-0.3, 0.3)   # workspace y bounds (m)
@@ -293,7 +293,7 @@ class AllegroHandHora(VecTask):
         self.hand_start_states = torch.zeros((self.num_envs, 7), device=self.device, dtype=torch.float)
         self.hand_start_states[:, 0] = 0.0   # x
         self.hand_start_states[:, 1] = 0.0   # y
-        self.hand_start_states[:, 2] = 0.2   # z（与 _init_object_pose 里的初始高度一致）
+        self.hand_start_states[:, 2] = 0.15  # z（与 _init_object_pose 里的初始高度一致）
         self.hand_start_states[:, 3:7] = initial_hand_quat.unsqueeze(0).repeat(self.num_envs, 1)
 
         # =========================================================================
@@ -765,8 +765,8 @@ class AllegroHandHora(VecTask):
 
     def _init_object_pose(self):
         allegro_hand_start_pose = gymapi.Transform()
-        # 【修改】将机械手掌心初始化在 0.2m 高空
-        allegro_hand_start_pose.p = gymapi.Vec3(0.0, 0.0, 0.2) 
+        # 手掌初始高度 0.15m：掌心在球（z=0.04m）上方约 11cm，指尖约在球顶部（z≈0.05m），处于抓取区域
+        allegro_hand_start_pose.p = gymapi.Vec3(0.0, 0.0, 0.15)
         
         # 绕 X 轴旋转 pi，让 Allegro 手的掌心正对地面 (-Z 方向)
         # R_x(pi) 将本体 +Z 轴映射到世界 -Z 轴，即指尖朝下，掌心朝地
