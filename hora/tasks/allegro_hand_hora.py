@@ -140,7 +140,7 @@ class AllegroHandHora(VecTask):
         self.base_max_speed = 0.5   # maximum translation speed (m/s)
         self.base_ws_x = (-0.3, 0.3)   # workspace x bounds (m)
         self.base_ws_y = (-0.3, 0.3)   # workspace y bounds (m)
-        self.base_ws_z = (0.05, 0.80)  # workspace z bounds (m); upper bound must exceed lift_z (object_init_z+0.1+0.003≈0.143m)
+        self.base_ws_z = (0.12, 0.80)  # workspace z bounds (m); lower bound changed to 0.12 to prevent ground/object penetration
 
     def _create_envs(self, num_envs, spacing, num_per_row):
         self._create_ground_plane()
@@ -458,7 +458,7 @@ class AllegroHandHora(VecTask):
         # 3. 调用奖励引擎 (对齐 UniDexGrasp2 else 分支，无 delta_value)
         # ==========================================
         self.rew_buf[:], self.reset_buf[:] = compute_hand_reward(
-            self.object_init_state[:, 2], self.reset_buf, self.progress_buf, self.max_episode_length,
+            self.object_init_state[:, 0:3], self.reset_buf, self.progress_buf, self.max_episode_length,
             self.object_pos, palm_pos, ff_pos, mf_pos, rf_pos, th_pos, target_pos, actions,
             self.reset_z_threshold,
         )
@@ -564,9 +564,10 @@ class AllegroHandHora(VecTask):
         new_pos[:, 1] = torch.clamp(new_pos[:, 1], self.base_ws_y[0], self.base_ws_y[1])
         new_pos[:, 2] = torch.clamp(new_pos[:, 2], self.base_ws_z[0], self.base_ws_z[1])
 
-        # 写回 root state tensor（位置直接设置，线速度归零以避免物理引擎再次积分）
+        # 写回 root state tensor（位置直接设置，姿态和速度锁定，避免物理引擎因碰撞产生奇怪的反弹和自转）
         self.root_state_tensor[hand_root_indices, 0:3] = new_pos
-        self.root_state_tensor[hand_root_indices, 7:10] = 0.0
+        self.root_state_tensor[hand_root_indices, 3:7] = self.hand_init_state[hand_root_indices, 3:7]
+        self.root_state_tensor[hand_root_indices, 7:13] = 0.0
 
         # 推送到仿真器
         hand_root_indices_int32 = hand_root_indices.to(torch.int32)
@@ -806,61 +807,78 @@ class AllegroHandHora(VecTask):
 
 @torch.jit.script
 def compute_hand_reward(
-        object_init_z: torch.Tensor, reset_buf: torch.Tensor, progress_buf: torch.Tensor, max_episode_length: float,
+        object_init_pos: torch.Tensor, reset_buf: torch.Tensor, progress_buf: torch.Tensor, max_episode_length: float,
         object_pos: torch.Tensor, palm_pos: torch.Tensor,
         ff_pos: torch.Tensor, mf_pos: torch.Tensor, rf_pos: torch.Tensor, th_pos: torch.Tensor,
-        target_pos: torch.Tensor, actions: torch.Tensor, reset_z_threshold: float,
-):
-    # ==========================================
-    # 1. Physics Parameters & Distances
-    # ==========================================
-    sphere_radius = 0.04  # URDF defined sphere radius
-    
-    hand_dist = torch.norm(object_pos - palm_pos, p=2, dim=-1)
-    
-    # Fingertip to surface distance to prevent penetration
-    ff_surf_dist = torch.clamp(torch.norm(object_pos - ff_pos, p=2, dim=-1) - sphere_radius, min=0.0)
-    mf_surf_dist = torch.clamp(torch.norm(object_pos - mf_pos, p=2, dim=-1) - sphere_radius, min=0.0)
-    rf_surf_dist = torch.clamp(torch.norm(object_pos - rf_pos, p=2, dim=-1) - sphere_radius, min=0.0)
-    th_surf_dist = torch.clamp(torch.norm(object_pos - th_pos, p=2, dim=-1) - sphere_radius, min=0.0)
-    finger_surf_dist = (ff_surf_dist + mf_surf_dist + rf_surf_dist + th_surf_dist) / 4.0
+        target_pos: torch.Tensor, actions: torch.Tensor, reset_z_threshold: float):
 
+    # ==========================================
+    # 1. 物理参数与位置计算
+    # ==========================================
+    sphere_radius = 0.04  # 网球半径 4cm
+    
+    # 【悬停目标】: 手掌基座(palm)应停在球心正上方 8cm 处 (笼顶)
+    palm_target_pos = object_init_pos.clone()
+    palm_target_pos[:, 2] += 0.08
+    palm_dist = torch.norm(palm_target_pos - palm_pos, p=2, dim=-1)
+    
+    # 指尖到球心的距离
+    ff_dist = torch.norm(object_pos - ff_pos, p=2, dim=-1)
+    mf_dist = torch.norm(object_pos - mf_pos, p=2, dim=-1)
+    rf_dist = torch.norm(object_pos - rf_pos, p=2, dim=-1)
+    th_dist = torch.norm(object_pos - th_pos, p=2, dim=-1)
+    
+    # 指尖到球表面的距离 (clamp min=0.0 防止穿模带来的负距离奖励欺骗)
+    ff_surf = torch.clamp(ff_dist - sphere_radius, min=0.0)
+    mf_surf = torch.clamp(mf_dist - sphere_radius, min=0.0)
+    rf_surf = torch.clamp(rf_dist - sphere_radius, min=0.0)
+    th_surf = torch.clamp(th_dist - sphere_radius, min=0.0)
+    finger_surf_dist = (ff_surf + mf_surf + rf_surf + th_surf) / 4.0
+
+    # ==========================================
+    # 2. 连续引导奖励 (Shaping Rewards)
+    # ==========================================
+    # 靠近奖励: 距离越近，接近 1.0
+    reach_reward = torch.exp(-10.0 * palm_dist)
+    # 包裹奖励: 指尖越贴近表面，接近 1.0
+    enclose_reward = torch.exp(-20.0 * finger_surf_dist)
+    
+    # 核心：抓取质量 (Grasp Quality)。只有手在上方且手指闭合，该值才高。
+    grasp_quality = reach_reward * enclose_reward
+
+    # ==========================================
+    # 3. 惩罚与抬升奖励 (Penalties & Lift)
+    # ==========================================
+    # 推挤惩罚: 只要球在水平面发生移动，严厉扣分，杜绝"推土机"和"挤压"行为
+    xy_moved = torch.norm(object_pos[:, :2] - object_init_pos[:, :2], p=2, dim=-1)
+    push_penalty = -10.0 * xy_moved
+
+    # 抬升高度
+    lift_height = torch.clamp(object_pos[:, 2] - object_init_pos[:, 2], min=0.0)
+    
+    # 乘法门控: 强迫 AI 必须保持高质量的抓取姿势，抬起球才能得分
+    lift_reward = 50.0 * lift_height * grasp_quality
+
+    # 动作惩罚: 基座惩罚高(-0.01)防止乱晃，手指惩罚低(-0.001)鼓励探索闭合
+    base_action_penalty = torch.sum(actions[:, 0:3] ** 2, dim=-1) * -0.01
+    finger_action_penalty = torch.sum(actions[:, 3:19] ** 2, dim=-1) * -0.001
+
+    # 汇总
+    reward = reach_reward + enclose_reward + lift_reward + push_penalty + base_action_penalty + finger_action_penalty
+
+    # ==========================================
+    # 4. 通关判定与重置
+    # ==========================================
     goal_dist = torch.norm(target_pos - object_pos, p=2, dim=-1)
-    lift_height = torch.clamp(object_pos[:, 2] - object_init_z, min=0.0)
-
-    # ==========================================
-    # 2. Continuous Dense Rewards
-    # ==========================================
-    reach_reward = torch.exp(-10.0 * hand_dist)
-    enclose_reward = torch.exp(-10.0 * finger_surf_dist)
-    
-    # Gate 1: Must grasp closely before lift reward is given
-    is_grasped = (finger_surf_dist < 0.02).float() 
-    lift_reward = torch.clamp(lift_height * 10.0 * is_grasped, min=0.0, max=3.0)
-
-    # Gate 2: Must be lifted to get goal reward
     is_lifted = (lift_height > 0.05).float()
-    goal_reward = torch.exp(-10.0 * goal_dist) * is_grasped * is_lifted
-
-    # Action penalties to prevent jitter
-    base_action_penalty = torch.sum(actions[:, 0:3] ** 2, dim=-1) * -0.05
-    finger_action_penalty = torch.sum(actions[:, 3:19] ** 2, dim=-1) * -0.01
-
-    # ==========================================
-    # 3. Success Bonus
-    # ==========================================
-    # Success condition: close to target and grasped
-    success_cond = torch.logical_and(goal_dist < 0.05, is_grasped == 1.0)
+    
+    # 成功条件：球到达目标高度，且真正被抬起
+    success_cond = torch.logical_and(goal_dist < 0.05, is_lifted == 1.0)
     success_bonus = torch.where(success_cond, torch.ones_like(goal_dist) * 200.0, torch.zeros_like(goal_dist))
+    reward += success_bonus
 
-    reward = reach_reward + enclose_reward + lift_reward + goal_reward + base_action_penalty + finger_action_penalty + success_bonus
-
-    # ==========================================
-    # 4. Resets
-    # ==========================================
     resets = torch.where(object_pos[:, 2] < reset_z_threshold, torch.ones_like(reset_buf), reset_buf)
     resets = torch.where(progress_buf >= max_episode_length, torch.ones_like(resets), resets)
-    # Early termination on success
     resets = torch.where(success_cond, torch.ones_like(resets), resets)
 
     return reward, resets
