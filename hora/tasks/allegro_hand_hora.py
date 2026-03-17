@@ -52,11 +52,13 @@ class AllegroHandHora(VecTask):
 
         # --- [Core Modification 1: Setup cage pre-grasp pose] ---
         # 16 joints: index, middle, ring, thumb. Each 4: [rotation, bend1, bend2, bend3]
+        # Fingers are opened out (0.1 rad bend) to prevent mesh interpenetration at reset.
+        # Thumb is abducted to joint_12=1.0 (within [0.263, 1.396] limit) to oppose fingers.
         cage_pose = [
-            0.0, 0.8, 0.5, 0.4,  # index
-            0.0, 0.8, 0.5, 0.4,  # middle
-            0.0, 0.8, 0.5, 0.4,  # ring
-            1.1, 0.6, 0.2, 0.5   # thumb
+            0.0,  0.1, 0.1, 0.1,  # index:  open, slightly bent
+            0.0,  0.1, 0.1, 0.1,  # middle: open
+            0.0,  0.1, 0.1, 0.1,  # ring:   open, slightly bent
+            1.0,  0.5, 0.4, 0.3   # thumb:  abducted and slightly curled to oppose fingers
         ]
         self.allegro_hand_default_dof_pos = to_torch(cage_pose, dtype=torch.float, device=sim_device)
 
