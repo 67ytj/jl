@@ -50,6 +50,16 @@ class AllegroHandHora(VecTask):
             'obj_com': (6, 9),
         }
 
+        # --- [Core Modification 1: Setup cage pre-grasp pose] ---
+        # 16 joints: index, middle, ring, thumb. Each 4: [rotation, bend1, bend2, bend3]
+        cage_pose = [
+            0.0, 0.8, 0.5, 0.4,  # index
+            0.0, 0.8, 0.5, 0.4,  # middle
+            0.0, 0.8, 0.5, 0.4,  # ring
+            1.1, 0.6, 0.2, 0.5   # thumb
+        ]
+        self.allegro_hand_default_dof_pos = to_torch(cage_pose, dtype=torch.float, device=sim_device)
+
         super().__init__(config, sim_device, graphics_device_id, headless)
 
         self.debug_viz = self.config['env']['enableDebugVis']
@@ -67,16 +77,6 @@ class AllegroHandHora(VecTask):
         rigid_body_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
         net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
 
-        # --- 【核心修改 1：设置笼式预抓取姿态】 ---
-        # 16个关节：食指、中指、无名指、拇指。每组4个：[旋转, 弯曲1, 弯曲2, 弯曲3]
-        cage_pose = [
-            0.0, 0.8, 0.5, 0.4,  # 食指弯曲
-            0.0, 0.8, 0.5, 0.4,  # 中指弯曲
-            0.0, 0.8, 0.5, 0.4,  # 无名指弯曲
-            1.1, 0.6, 0.2, 0.5   # 拇指外展并微弯
-        ]
-        self.allegro_hand_default_dof_pos = torch.tensor(cage_pose, dtype=torch.float, device=self.device)
-        
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)
         self.allegro_hand_dof_state = self.dof_state.view(self.num_envs, -1, 2)[:, :self.num_allegro_hand_dofs]
