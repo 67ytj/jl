@@ -20,7 +20,7 @@ env:
   genGrasps: False
   clipObservations: 5.0
   clipActions: 1.0
-  reset_height_threshold: 0.01
+  reset_height_threshold: -0.05
   # 关键修复：如果你没有 cache 文件夹里的文件，请先尝试将此项改为空或不存在的名字
   grasp_cache_name: '' 
 

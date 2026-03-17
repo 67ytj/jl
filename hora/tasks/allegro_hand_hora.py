@@ -424,8 +424,10 @@ class AllegroHandHora(VecTask):
         # -----------------------------------------------------------------------
         palm_pos_obs = self.rigid_body_states[:, self.hand_base_rigid_body_index, 0:3]
         rel_pos_obs = self.object_pos - palm_pos_obs
-        self.obs_buf[:, 96:99] = palm_pos_obs
-        self.obs_buf[:, 99:102] = rel_pos_obs
+        
+        # Hard normalization to match the [-1, 1] scale of joint angles
+        self.obs_buf[:, 96:99] = palm_pos_obs / 0.5
+        self.obs_buf[:, 99:102] = rel_pos_obs / 0.5
 
         self.proprio_hist_buf[:] = self.obs_buf_lag_history[:, -self.prop_hist_len:].clone()
         self._update_priv_buf(env_id=range(self.num_envs), name='obj_position', value=self.object_pos.clone())
@@ -806,53 +808,56 @@ def compute_hand_reward(
         target_pos: torch.Tensor, actions: torch.Tensor, reset_z_threshold: float,
 ):
     # ==========================================
-    # 1. 基础物理距离计算
+    # 1. Physics Parameters & Distances
     # ==========================================
-    goal_dist = torch.norm(target_pos - object_pos, p=2, dim=-1)
-    goal_hand_dist = torch.norm(target_pos - palm_pos, p=2, dim=-1)
-
+    sphere_radius = 0.04  # URDF defined sphere radius
+    
     hand_dist = torch.norm(object_pos - palm_pos, p=2, dim=-1)
-    hand_dist = torch.where(hand_dist >= 0.5, 0.5 + 0 * hand_dist, hand_dist)
+    
+    # Fingertip to surface distance to prevent penetration
+    ff_surf_dist = torch.clamp(torch.norm(object_pos - ff_pos, p=2, dim=-1) - sphere_radius, min=0.0)
+    mf_surf_dist = torch.clamp(torch.norm(object_pos - mf_pos, p=2, dim=-1) - sphere_radius, min=0.0)
+    rf_surf_dist = torch.clamp(torch.norm(object_pos - rf_pos, p=2, dim=-1) - sphere_radius, min=0.0)
+    th_surf_dist = torch.clamp(torch.norm(object_pos - th_pos, p=2, dim=-1) - sphere_radius, min=0.0)
+    finger_surf_dist = (ff_surf_dist + mf_surf_dist + rf_surf_dist + th_surf_dist) / 4.0
 
-    finger_dist = (
-            torch.norm(object_pos - ff_pos, p=2, dim=-1) +
-            torch.norm(object_pos - mf_pos, p=2, dim=-1) +
-            torch.norm(object_pos - rf_pos, p=2, dim=-1) +
-            torch.norm(object_pos - th_pos, p=2, dim=-1)
-    )
-    finger_dist = torch.where(finger_dist >= 2.0, 2.0 + 0 * finger_dist, finger_dist)
-
-    # ==========================================
-    # 2. 状态机门控逻辑与奖励
-    # ==========================================
-    flag = (finger_dist <= 0.6).int() + (hand_dist <= 0.12).int()
-
-    lowest = object_pos[:, 2]
-    lift_z = object_init_z + 0.1 + 0.003  # 抬升阈值：球初始高度 + 0.1m（可达）
-
-    # 稠密接近奖励：鼓励手掌靠近球（无需 flag 门控）
-    approach_rew = torch.clamp(0.3 - hand_dist, min=0.0) * 2.0
-
-    goal_hand_rew = torch.zeros_like(finger_dist)
-    # flag==2：手掌和指尖都接近球，给满额奖励
-    goal_hand_rew = torch.where(flag == 2, torch.clamp(1.0 * (0.9 - 2.0 * goal_dist), min=0.0), goal_hand_rew)
-    # flag==1：仅满足一个条件，给半额奖励（提供中间梯度）
-    goal_hand_rew = torch.where(flag == 1, torch.clamp(0.5 * (0.9 - 2.0 * goal_dist), min=0.0), goal_hand_rew)
-
-    hand_up = torch.zeros_like(finger_dist)
-    hand_up = torch.where(lowest >= lift_z, torch.where(flag == 2, 0.1 + 0.1 * actions[:, 2], hand_up), hand_up)
-    hand_up = torch.where(lowest >= 0.80, torch.where(flag == 2, 0.2 - goal_hand_dist * 0, hand_up), hand_up)
-
-    bonus = torch.zeros_like(goal_dist)
-    bonus = torch.where(flag == 2, torch.where(goal_dist <= 0.05, 1.0 / (1.0 + 10.0 * goal_dist), bonus), bonus)
+    goal_dist = torch.norm(target_pos - object_pos, p=2, dim=-1)
+    lift_height = torch.clamp(object_pos[:, 2] - object_init_z, min=0.0)
 
     # ==========================================
-    # 3. 汇总总分
+    # 2. Continuous Dense Rewards
     # ==========================================
-    reward = -0.5 * finger_dist - 1.0 * hand_dist + approach_rew + goal_hand_rew + hand_up + bonus
+    reach_reward = torch.exp(-10.0 * hand_dist)
+    enclose_reward = torch.exp(-10.0 * finger_surf_dist)
+    
+    # Gate 1: Must grasp closely before lift reward is given
+    is_grasped = (finger_surf_dist < 0.02).float() 
+    lift_reward = torch.clamp(lift_height * 10.0 * is_grasped, min=0.0, max=3.0)
 
-    resets = torch.where(lowest < reset_z_threshold, torch.ones_like(reset_buf), reset_buf)
+    # Gate 2: Must be lifted to get goal reward
+    is_lifted = (lift_height > 0.05).float()
+    goal_reward = torch.exp(-10.0 * goal_dist) * is_grasped * is_lifted
+
+    # Action penalties to prevent jitter
+    base_action_penalty = torch.sum(actions[:, 0:3] ** 2, dim=-1) * -0.05
+    finger_action_penalty = torch.sum(actions[:, 3:19] ** 2, dim=-1) * -0.01
+
+    # ==========================================
+    # 3. Success Bonus
+    # ==========================================
+    # Success condition: close to target and grasped
+    success_cond = torch.logical_and(goal_dist < 0.05, is_grasped == 1.0)
+    success_bonus = torch.where(success_cond, torch.ones_like(goal_dist) * 200.0, torch.zeros_like(goal_dist))
+
+    reward = reach_reward + enclose_reward + lift_reward + goal_reward + base_action_penalty + finger_action_penalty + success_bonus
+
+    # ==========================================
+    # 4. Resets
+    # ==========================================
+    resets = torch.where(object_pos[:, 2] < reset_z_threshold, torch.ones_like(reset_buf), reset_buf)
     resets = torch.where(progress_buf >= max_episode_length, torch.ones_like(resets), resets)
+    # Early termination on success
+    resets = torch.where(success_cond, torch.ones_like(resets), resets)
 
     return reward, resets
 
