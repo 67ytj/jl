@@ -90,10 +90,6 @@ class AllegroHandHora(VecTask):
 
         self._refresh_gym()
 
-        self.num_dofs = self.gym.get_sim_dof_count(self.sim) // self.num_envs
-
-        self.prev_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
-        self.cur_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
         # object apply random forces parameters
         self.force_scale = self.config['env'].get('forceScale', 0.0)
         self.random_force_prob_scalar = self.config['env'].get('randomForceProbScalar', 0.0)
@@ -112,13 +108,8 @@ class AllegroHandHora(VecTask):
         # useful buffers
         self.object_rot_prev = self.object_rot.clone()
         self.object_pos_prev = self.object_pos.clone()
-        self.init_pose_buf = torch.zeros((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float)
         self.actions = torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=torch.float)
         self.torques = torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=torch.float)
-        self.dof_vel_finite_diff = torch.zeros((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float)
-        assert type(self.p_gain) in [int, float] and type(self.d_gain) in [int, float], 'assume p_gain and d_gain are only scalars'
-        self.p_gain = torch.ones((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float) * self.p_gain
-        self.d_gain = torch.ones((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float) * self.d_gain
 
         # debug and understanding statistics
         self.env_timeout_counter = to_torch(np.zeros((len(self.envs)))).long().to(self.device)  # max 10 (10000 envs)
@@ -179,6 +170,17 @@ class AllegroHandHora(VecTask):
 
         self.allegro_hand_dof_lower_limits = to_torch(self.allegro_hand_dof_lower_limits, device=self.device)
         self.allegro_hand_dof_upper_limits = to_torch(self.allegro_hand_dof_upper_limits, device=self.device)
+
+        # Allocate DOF-dependent task buffers here because _create_envs is called
+        # during super().__init__() before __init__ can allocate them.
+        self.num_dofs = self.num_allegro_hand_dofs
+        self.prev_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
+        self.cur_targets = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
+        self.init_pose_buf = torch.zeros((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float)
+        self.dof_vel_finite_diff = torch.zeros((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float)
+        assert type(self.p_gain) in [int, float] and type(self.d_gain) in [int, float], 'assume p_gain and d_gain are only scalars'
+        self.p_gain = torch.ones((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float) * self.p_gain
+        self.d_gain = torch.ones((self.num_envs, self.num_dofs), device=self.device, dtype=torch.float) * self.d_gain
 
         hand_pose, obj_pose = self._init_object_pose()
 
