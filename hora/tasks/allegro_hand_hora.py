@@ -777,9 +777,11 @@ class AllegroHandHora(VecTask):
         # 手掌初始高度 0.15m：掌心在球（z=0.04m）上方约 11cm，指尖约在球顶部（z≈0.05m），处于抓取区域
         allegro_hand_start_pose.p = gymapi.Vec3(0.0, 0.0, 0.15)
         
-        # 绕 X 轴旋转 pi，让 Allegro 手的掌心正对地面 (-Z 方向)
-        # R_x(pi) 将本体 +Z 轴映射到世界 -Z 轴，即指尖朝下，掌心朝地
-        allegro_hand_start_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi)
+        # 绕 X 轴旋转 pi (180度) 使掌心朝下，再绕 Z 轴旋转 -pi/2 (-90度) 调整手的朝向，
+        # 让大拇指和其余四指处于能够包裹球的角度
+        quat_x = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), np.pi)
+        quat_z = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 0, 1), -np.pi/2)
+        allegro_hand_start_pose.r = quat_z * quat_x
 
         object_start_pose = gymapi.Transform()
         # 【修正】Vec3 只能接收 3 个参数 (x, y, z)，设置球在桌面的高度为 0.04m
@@ -815,11 +817,11 @@ def compute_hand_reward(
     # ==========================================
     # 1. 物理参数与位置计算
     # ==========================================
-    sphere_radius = 0.04  # 网球半径 4cm
+    sphere_radius = 0.04 * 0.8  # 网球原始半径0.04，且有0.8的baseObjScale缩放，所以真实物理半径是0.032m
     
-    # 【悬停目标】: 手掌基座(palm)应停在球心正上方 8cm 处 (笼顶)
+    # 悬停目标: 手掌基座(palm)应停在球心正上方 10cm 处 (确保手掌留出空间给手指包裹，不要压太低)
     palm_target_pos = object_init_pos.clone()
-    palm_target_pos[:, 2] += 0.08
+    palm_target_pos[:, 2] += 0.10
     palm_dist = torch.norm(palm_target_pos - palm_pos, p=2, dim=-1)
     
     # 指尖到球心的距离
@@ -828,56 +830,68 @@ def compute_hand_reward(
     rf_dist = torch.norm(object_pos - rf_pos, p=2, dim=-1)
     th_dist = torch.norm(object_pos - th_pos, p=2, dim=-1)
     
-    # 指尖到球表面的距离 (clamp min=0.0 防止穿模带来的负距离奖励欺骗)
-    ff_surf = torch.clamp(ff_dist - sphere_radius, min=0.0)
-    mf_surf = torch.clamp(mf_dist - sphere_radius, min=0.0)
-    rf_surf = torch.clamp(rf_dist - sphere_radius, min=0.0)
-    th_surf = torch.clamp(th_dist - sphere_radius, min=0.0)
-    finger_surf_dist = (ff_surf + mf_surf + rf_surf + th_surf) / 4.0
+    # 指尖到球表面的距离 (加上0.005m缓冲，防止穿模惩罚)
+    ff_surf = torch.clamp(ff_dist - sphere_radius, min=0.005)
+    mf_surf = torch.clamp(mf_dist - sphere_radius, min=0.005)
+    rf_surf = torch.clamp(rf_dist - sphere_radius, min=0.005)
+    th_surf = torch.clamp(th_dist - sphere_radius, min=0.005)
+    
+    # 计算拇指与其它三指的相对对立距离 (Opposability)
+    # 笼式抓取的核心是大拇指应该与另外三指形成对立面
+    finger_center = (ff_pos + mf_pos + rf_pos) / 3.0
+    thumb_oppose_dist = torch.norm(th_pos - finger_center, p=2, dim=-1)
 
     # ==========================================
     # 2. 连续引导奖励 (Shaping Rewards)
     # ==========================================
-    # 靠近奖励: 距离越近，接近 1.0
-    reach_reward = torch.exp(-10.0 * palm_dist)
-    # 包裹奖励: 指尖越贴近表面，接近 1.0
-    enclose_reward = torch.exp(-20.0 * finger_surf_dist)
+    # 靠近奖励 (Hand Approach): 手掌越靠近目标点(球上方)，奖励越高
+    reach_reward = 2.0 * torch.exp(-10.0 * palm_dist)
     
-    # 核心：抓取质量 (Grasp Quality)。只有手在上方且手指闭合，该值才高。
-    grasp_quality = reach_reward * enclose_reward
+    # 笼式包裹奖励 (Cage Enclose): 要求四个指尖同时贴近球表面，但不是死死掐住
+    enclose_dist = (ff_surf + mf_surf + rf_surf + th_surf) / 4.0
+    enclose_reward = 3.0 * torch.exp(-20.0 * enclose_dist)
+    
+    # 对立姿态奖励 (Thumb Opposing): 鼓励大拇指与其它三指形成夹角和对抗距离
+    oppose_reward = 1.0 * torch.clamp(thumb_oppose_dist, max=0.1) * 10.0
+    
+    # 门控: 只有手到达了球上方，并且手指摆出了笼式姿态，才被认为抓取质量高
+    grasp_quality = reach_reward * enclose_reward * oppose_reward
 
     # ==========================================
     # 3. 惩罚与抬升奖励 (Penalties & Lift)
     # ==========================================
-    # 推挤惩罚: 只要球在水平面发生移动，严厉扣分，杜绝"推土机"和"挤压"行为
+    # 滑动/掉落惩罚: 如果球在没被抬起的情况下跑到了水平面外，说明被碰飞了！
     xy_moved = torch.norm(object_pos[:, :2] - object_init_pos[:, :2], p=2, dim=-1)
-    push_penalty = -10.0 * xy_moved
+    # 只要位移超过了球的半径，就开始严厉扣分
+    push_penalty = torch.where(xy_moved > sphere_radius, -50.0 * (xy_moved - sphere_radius), torch.zeros_like(xy_moved))
 
     # 抬升高度
     lift_height = torch.clamp(object_pos[:, 2] - object_init_pos[:, 2], min=0.0)
     
-    # 乘法门控: 强迫 AI 必须保持高质量的抓取姿势，抬起球才能得分
-    lift_reward = 50.0 * lift_height * grasp_quality
+    # 抬升必须与抓取质量挂钩：如果只是撞飞球导致球飞起来，grasp_quality很低，拿不到抬升分
+    lift_reward = 100.0 * lift_height * grasp_quality
 
-    # 动作惩罚: 基座惩罚高(-0.01)防止乱晃，手指惩罚低(-0.001)鼓励探索闭合
-    base_action_penalty = torch.sum(actions[:, 0:3] ** 2, dim=-1) * -0.01
-    finger_action_penalty = torch.sum(actions[:, 3:19] ** 2, dim=-1) * -0.001
-
-    # 汇总
-    reward = reach_reward + enclose_reward + lift_reward + push_penalty + base_action_penalty + finger_action_penalty
+    # 动作平滑度惩罚: 控制抖动
+    base_action_penalty = torch.sum(actions[:, 0:3] ** 2, dim=-1) * -0.05
+    finger_action_penalty = torch.sum(actions[:, 3:19] ** 2, dim=-1) * -0.01
 
     # ==========================================
-    # 4. 通关判定与重置
+    # 4. 汇总与通关判定
     # ==========================================
+    reward = reach_reward + enclose_reward + oppose_reward + lift_reward + push_penalty + base_action_penalty + finger_action_penalty
+
     goal_dist = torch.norm(target_pos - object_pos, p=2, dim=-1)
     is_lifted = (lift_height > 0.05).float()
     
-    # 成功条件：球到达目标高度，且真正被抬起
+    # 成功条件：球被抬起且到达目标高度，且没有滑落
     success_cond = torch.logical_and(goal_dist < 0.05, is_lifted == 1.0)
-    success_bonus = torch.where(success_cond, torch.ones_like(goal_dist) * 200.0, torch.zeros_like(goal_dist))
+    success_bonus = torch.where(success_cond, torch.ones_like(goal_dist) * 500.0, torch.zeros_like(goal_dist))
     reward += success_bonus
 
+    # 失败重置: 球滚走了、掉地上了、或者时间到了
     resets = torch.where(object_pos[:, 2] < reset_z_threshold, torch.ones_like(reset_buf), reset_buf)
+    # 如果球滚远了，直接判定为失败并重置，防止AI在球飞了以后继续无效探索
+    resets = torch.where(xy_moved > 0.15, torch.ones_like(resets), resets)
     resets = torch.where(progress_buf >= max_episode_length, torch.ones_like(resets), resets)
     resets = torch.where(success_cond, torch.ones_like(resets), resets)
 
